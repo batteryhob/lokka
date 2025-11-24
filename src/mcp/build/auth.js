@@ -1,9 +1,45 @@
-import { ClientSecretCredential, ClientCertificateCredential, InteractiveBrowserCredential, DeviceCodeCredential } from "@azure/identity";
+import { ClientSecretCredential, ClientCertificateCredential, InteractiveBrowserCredential, DeviceCodeCredential, useIdentityPlugin, serializeAuthenticationRecord, deserializeAuthenticationRecord } from "@azure/identity";
+import { cachePersistencePlugin } from "@azure/identity-cache-persistence";
 import jwt from "jsonwebtoken";
+import fs from "fs";
+import path from "path";
+import os from "os";
 import { logger } from "./logger.js";
 import { LokkaClientId, LokkaDefaultTenantId, LokkaDefaultRedirectUri } from "./constants.js";
+// Enable token cache persistence plugin
+useIdentityPlugin(cachePersistencePlugin);
 // Constants
 const ONE_HOUR_IN_MS = 60 * 60 * 1000; // One hour in milliseconds
+const AUTH_RECORD_DIR = path.join(os.homedir(), ".lokka");
+const AUTH_RECORD_PATH = path.join(AUTH_RECORD_DIR, "auth-record.json");
+// Helper functions for authentication record persistence
+function saveAuthenticationRecord(record) {
+    try {
+        if (!fs.existsSync(AUTH_RECORD_DIR)) {
+            fs.mkdirSync(AUTH_RECORD_DIR, { recursive: true, mode: 0o700 });
+        }
+        const serialized = serializeAuthenticationRecord(record);
+        fs.writeFileSync(AUTH_RECORD_PATH, serialized, { mode: 0o600 });
+        logger.info("Authentication record saved successfully");
+    }
+    catch (error) {
+        logger.error("Failed to save authentication record", error);
+    }
+}
+function loadAuthenticationRecord() {
+    try {
+        if (fs.existsSync(AUTH_RECORD_PATH)) {
+            const data = fs.readFileSync(AUTH_RECORD_PATH, "utf-8");
+            const record = deserializeAuthenticationRecord(data);
+            logger.info("Authentication record loaded successfully");
+            return record;
+        }
+    }
+    catch (error) {
+        logger.error("Failed to load authentication record", error);
+    }
+    return undefined;
+}
 // Helper function to parse JWT and extract scopes
 function parseJwtScopes(token) {
     try {
@@ -124,18 +160,37 @@ export class AuthManager {
                 const tenantId = this.config.tenantId || LokkaDefaultTenantId;
                 const clientId = this.config.clientId || LokkaClientId;
                 logger.info(`Initializing Interactive authentication with tenant ID: ${tenantId}, client ID: ${clientId}`);
+                // Try to load existing authentication record for silent auth
+                const existingRecord = loadAuthenticationRecord();
+                if (existingRecord) {
+                    logger.info("Found existing authentication record, attempting silent authentication");
+                }
                 try {
                     // Try Interactive Browser first
-                    this.credential = new InteractiveBrowserCredential({
+                    const browserCredential = new InteractiveBrowserCredential({
                         tenantId: tenantId,
                         clientId: clientId,
                         redirectUri: this.config.redirectUri || LokkaDefaultRedirectUri,
+                        tokenCachePersistenceOptions: {
+                            enabled: true,
+                            name: "lokka"
+                        },
+                        authenticationRecord: existingRecord
                     });
+                    // If no existing record, authenticate and save the record
+                    if (!existingRecord) {
+                        logger.info("No existing auth record, performing interactive authentication");
+                        const record = await browserCredential.authenticate(["https://graph.microsoft.com/.default"]);
+                        if (record) {
+                            saveAuthenticationRecord(record);
+                        }
+                    }
+                    this.credential = browserCredential;
                 }
                 catch (error) {
                     // Fallback to Device Code flow
                     logger.info("Interactive browser failed, falling back to device code flow");
-                    this.credential = new DeviceCodeCredential({
+                    const deviceCodeCredential = new DeviceCodeCredential({
                         tenantId: tenantId,
                         clientId: clientId,
                         userPromptCallback: (info) => {
@@ -144,7 +199,21 @@ export class AuthManager {
                             console.log(`And enter code: ${info.userCode}\n`);
                             return Promise.resolve();
                         },
+                        tokenCachePersistenceOptions: {
+                            enabled: true,
+                            name: "lokka"
+                        },
+                        authenticationRecord: existingRecord
                     });
+                    // If no existing record, authenticate and save the record
+                    if (!existingRecord) {
+                        logger.info("No existing auth record, performing device code authentication");
+                        const record = await deviceCodeCredential.authenticate(["https://graph.microsoft.com/.default"]);
+                        if (record) {
+                            saveAuthenticationRecord(record);
+                        }
+                    }
+                    this.credential = deviceCodeCredential;
                 }
                 break;
             default:
